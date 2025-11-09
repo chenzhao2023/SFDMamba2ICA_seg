@@ -93,11 +93,15 @@ To ensure the project runs smoothly, please organize your data according to the 
 project_root/
 ├── dataset/
 │   ├── train/
-│   │   ├── ICA_PNG/
-│   │   └── label/
+│   │   ├── source/
+│   │   │   ├── images/
+│   │   │   └── masks/
+│   │   └── target/
+│   │       ├── images/
+│   │       └── masks/
 │   └── test/
-│       ├── ICA_PNG/
-│       └── label/
+│       ├── images/
+│       └── masks/ 
 ├── weight/
 ├── results_txt/
 ├── outputs/
