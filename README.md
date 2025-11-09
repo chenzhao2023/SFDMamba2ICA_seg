@@ -3,7 +3,7 @@
 
 ## Architecture Overview
 
-![](pic/SFD_Mamba2Net.png)
+![](pic/SFD_Mamba2Net.jpg)
 
 The overall architecture of SFD-Mamba2Net is an asymmetric encoder–decoder framework,  which integrates multiple innovative structural modules to improve performance in medical image segmentation tasks:
 
