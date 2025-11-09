@@ -1,119 +1,108 @@
 import os
-from time import time
+import time
 import torch
 import numpy as np
 from PIL import Image
 from torch.utils.data import DataLoader
-from data import *
+from data import TargetDataset
 from net import *
 
-def binary_dice(pred, label):
-    assert len(pred.shape) == len(label.shape)
-    intersection = np.sum(np.logical_and(pred == 1, label == 1))
-    union = np.sum(pred == 1) + np.sum(label == 1)
-    dice = 2.0 * intersection / (union + 1e-10)
-    return dice
+def dice_coeff(pred, label):
+    pred = pred.astype(np.bool_)
+    label = label.astype(np.bool_)
+    intersection = np.logical_and(pred, label).sum()
+    return (2. * intersection) / (pred.sum() + label.sum() + 1e-10)
 
-def binary_sensitivity(gt, seg):
-    assert len(gt.shape) == len(seg.shape)
-    tp = np.sum(np.logical_and(gt > 0, seg > 0))
-    tn = np.sum(np.logical_and(gt == 0, seg == 0))
-    fp = np.sum(np.logical_and(gt == 0, seg > 0))
-    fn = np.sum(np.logical_and(gt > 0, seg == 0))
+def sensitivity(gt, seg):
+    tp = np.logical_and(gt == 1, seg == 1).sum()
+    fn = np.logical_and(gt == 1, seg == 0).sum()
+    return tp / (tp + fn + 1e-10)
 
-    sensitivity = tp / (tp + fn)
-    specificity = tn / (tn + fp)
-    return sensitivity, specificity
+def specificity(gt, seg):
+    tn = np.logical_and(gt == 0, seg == 0).sum()
+    fp = np.logical_and(gt == 0, seg == 1).sum()
+    return tn / (tn + fp + 1e-10)
 
-def prediction(data_path=False, model_path=False):
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    data_path = r'dataset/test'  # todo: 测试集路径
-
-    outputs_path = 'outputs'  # todo 测试结果保存路径
-    if os.path.exists(outputs_path) is False:
-        os.mkdir(outputs_path)
-
-    dice_list = []
-    sens_list = []
-    spec_list = []
-
-    print('test')
+def evaluate_model(weight_path, loader, device):
+    print(f"\nEvaluating weight file: {weight_path}")
     net = SFD_Mamba2Net().to(device)
-    net.load_state_dict(torch.load(model_path, map_location='cuda:0'))
 
-    data_loader = torch.utils.data.DataLoader(MyDataset(data_path), batch_size=1, shuffle=True)
+    checkpoint = torch.load(weight_path, map_location=device)
+    if "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    else:
+        state_dict = checkpoint
+    net.load_state_dict(state_dict, strict=False)
 
     net.eval()
-    st = time()
+    dice_list, sens_list, spec_list = [], [], []
+    outputs_dir = "outputs"
+    os.makedirs(outputs_dir, exist_ok=True)
 
-    for batch_idx, (data, label, segment_name) in enumerate(data_loader):
-        with torch.no_grad():
-            label = label.to(device)
-            pred = net(data.to(device))
-            pred = pred.squeeze().cpu().numpy()
-            label = label.squeeze().cpu().numpy()
-            #print("Pred shape:", pred.shape)
+    start_time = time.time()
+    with torch.no_grad():
+        for img, mask, name in loader:
+            img, mask = img.to(device), mask.to(device)
+            pred, _ = net(img)
+            pred = torch.sigmoid(pred).squeeze().cpu().numpy()
+            mask = mask.squeeze().cpu().numpy()
 
-            pred[pred >= 0.5] = 1
-            pred[pred < 0.5] = 0
-            save_img = (pred * 255).astype(np.uint8)
-            image = Image.fromarray(save_img)
-            image.save(f'{outputs_path}/{segment_name[0]}')
+            pred_bin = (pred >= 0.5).astype(np.uint8)
+            save_img = (pred_bin * 255).astype(np.uint8)
+            Image.fromarray(save_img).save(os.path.join(outputs_dir, name[0]))
 
-            dice = binary_dice(pred, label)
-            sens, spec = binary_sensitivity(label, pred)
-            dice_list.append(dice)
-            sens_list.append(sens)
-            spec_list.append(spec)
-            average_dice = np.mean(dice_list)
-            average_sens = np.mean(sens_list)
-            average_spec = np.mean(spec_list)
+            dice_list.append(dice_coeff(pred_bin, mask))
+            sens_list.append(sensitivity(mask, pred_bin))
+            spec_list.append(specificity(mask, pred_bin))
 
-            et = time()
+    avg_dice = float(np.mean(dice_list))
+    avg_sens = float(np.mean(sens_list))
+    avg_spec = float(np.mean(spec_list))
+    elapsed = time.time() - start_time
 
-    print(f'val_dice:{average_dice}, val_sens:{average_sens}, val_spec:{average_spec}')
-    return average_dice, average_sens, average_spec
+    print(f"val_dice: {avg_dice:.4f}, val_sens: {avg_sens:.4f}, val_spec: {avg_spec:.4f}, time: {elapsed:.2f}s")
+    return avg_dice, avg_sens, avg_spec
 
-def test_multiple_weights(weights_dir, data_path):
-    # 遍历目录中的所有权重文件
-    weight_files = [f for f in os.listdir(weights_dir) if f.endswith('.pth')]
+def test_all_weights():
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    weights_dir = "weights"
+    data_path = "dataset/test"
+    weight_files = [f for f in os.listdir(weights_dir) if f.endswith(".pth")]
 
     if not weight_files:
-        print("没有找到任何权重文件！")
+        print("No weight files found!")
         return
 
-    best_dice = -1
-    best_weight = None
+    test_results_dir = "test_results"
+    os.makedirs(test_results_dir, exist_ok=True)
 
-    # 遍历每个权重文件
+    dataset = TargetDataset(os.path.join(data_path, "images"),
+                            os.path.join(data_path, "masks"))
+    loader = DataLoader(dataset, batch_size=1, shuffle=False)
+
+    best_dice, best_weight = -1, None
+
     for weight_file in weight_files:
-        model_path = os.path.join(weights_dir, weight_file)
-        print(f'正在测试权重文件: {model_path}')
+        weight_path = os.path.join(weights_dir, weight_file)
+        avg_dice, avg_sens, avg_spec = evaluate_model(weight_path, loader, device)
 
-        avg_dice, avg_sens, avg_spec = prediction(data_path=data_path, model_path=model_path)
-
-        if avg_dice > best_dice:
-            best_dice = avg_dice
-            best_weight = weight_file
-
-        result_filename = os.path.join('test_results', f"{os.path.splitext(weight_file)[0]}_results.txt")
-        if not os.path.exists('test_results'):
-            os.mkdir('test_results')
-
-        with open(result_filename, 'w') as f:
+        result_path = os.path.join(test_results_dir, f"{os.path.splitext(weight_file)[0]}_results.txt")
+        with open(result_path, "w") as f:
             f.write(f"Test Results for {weight_file}:\n")
             f.write(f"Average Dice: {avg_dice:.4f}\n")
             f.write(f"Average Sensitivity: {avg_sens:.4f}\n")
             f.write(f"Average Specificity: {avg_spec:.4f}\n")
+        print(f"Results saved to {result_path}")
 
-        print(f"结果已保存到 {result_filename}")
+        if avg_dice > best_dice:
+            best_dice, best_weight = avg_dice, weight_file
 
     if best_weight:
-        print(f"最优权重文件: {best_weight}，对应的Dice值: {best_dice:.4f}")
+        print("\n================= Best Result =================")
+        print(f"Best weight file: {best_weight}, Dice: {best_dice:.4f}")
     else:
-        print("未找到最优权重文件。")
+        print("No best weight file found.")
 
-if __name__ == '__main__':
-    weights_dir = 'weight'
-    data_path = 'dataset/test'
-    test_multiple_weights(weights_dir, data_path)
+# ----------------- Main Entry -----------------
+if __name__ == "__main__":
+    test_all_weights()
