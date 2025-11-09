@@ -4,39 +4,34 @@ from torch.nn import functional as F, Conv2d
 from PHFP import *
 from AA_DSMamba2 import *
 from CASE import *
+from SDA_Module import SDA_Module
 from typing import List
-from timm.layers import  DropPath, to_2tuple, trunc_normal_
+from timm.layers import DropPath, to_2tuple, trunc_normal_
 import math
 
 class ChannelAttention(nn.Module):
     def __init__(self, in_channels, reduction_ratio=4):
         super().__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        hidden_channels = max(in_channels // reduction_ratio, 4)  # avoid too-small intermediate dims
-
-        # dynamically generate weights: map 65 channels to 64 channels
+        hidden_channels = max(in_channels // reduction_ratio, 4)
         self.fc = nn.Sequential(
             nn.Linear(in_channels, hidden_channels, bias=False),
             nn.ReLU(),
-            nn.Linear(hidden_channels, 64, bias=False),  # target output channels = 64
-            nn.Sigmoid()   # normalize weights to [0, 1]
+            nn.Linear(hidden_channels, 64, bias=False),
+            nn.Sigmoid()
         )
 
     def forward(self, x):
-        # x shape: [B, C=65, H, W]
         b, c, _, _ = x.shape
-        y = self.avg_pool(x).view(b, c)  # [B, C]
-        weights = self.fc(y).view(b, 64, 1, 1)  # [B, 64, 1, 1]
-
-        # weighted summation: broadcast 64-channel weights to first 64 channels
-        # CASE channel (C=65) is implicitly fused
-        # note: assumes CASE feature is the 65-th channel; adjust if needed
-        selected = x[:, :64, :, :] * weights  # [B, 64, H, W]
+        y = self.avg_pool(x).view(b, c)
+        weights = self.fc(y).view(b, 64, 1, 1)
+        selected = x[:, :64, :, :] * weights
         return selected
+
 
 class Conv_Block(nn.Module):
     def __init__(self, in_channel, out_channel):
-        super(Conv_Block, self).__init__()
+        super().__init__()
         self.layer = nn.Sequential(
             nn.Conv2d(in_channel, out_channel, 3, 1, 1, padding_mode='reflect', bias=False),
             nn.BatchNorm2d(out_channel),
@@ -54,7 +49,7 @@ class Conv_Block(nn.Module):
 
 class Downsample(nn.Module):
     def __init__(self, channel):
-        super(Downsample, self).__init__()
+        super().__init__()
         self.layer = nn.Sequential(
             nn.Conv2d(channel, channel, 3, 2, 1, padding_mode='reflect', bias=False),
             nn.BatchNorm2d(channel),
@@ -67,22 +62,22 @@ class Downsample(nn.Module):
 
 class Upsample(nn.Module):
     def __init__(self, channel):
-        super(Upsample, self).__init__()
+        super().__init__()
         self.layer = nn.Conv2d(channel, channel // 2, 1, 1)
 
     def forward(self, x, feature_map):
         up = F.interpolate(x, scale_factor=2, mode='nearest')
         out = self.layer(up)
-        return torch.cat((out, feature_map), dim=1)  # concatenate along channel dim = 1
+        return torch.cat((out, feature_map), dim=1)
 
 
 class SFD_Mamba2Net(nn.Module):
     def __init__(self):
-        super(SFD_Mamba2Net, self).__init__()
-        self.c1 = Conv_Block(1, 64)  # first convolutional layer
-        self.CASE = CASE(scales=[1, 2, 3], beta=0.5, c=15)# beta=1.0, c=0.1
-        # dynamic channel-selection module
-        self.channel_attn = ChannelAttention(in_channels=64 + 1)   # expects 65 channels after concat
+        super().__init__()
+
+        self.c1 = Conv_Block(1, 64)
+        self.CASE = CASE(scales=[1, 2, 3], beta=0.5, c=15)
+        self.channel_attn = ChannelAttention(in_channels=64 + 1)
         self.d1 = Downsample(64)
         self.c2 = Conv_Block(64, 128)
         self.d2 = Downsample(128)
@@ -92,7 +87,8 @@ class SFD_Mamba2Net(nn.Module):
         self.d4 = Downsample(512)
         self.c5 = Conv_Block(512, 1024)
 
-        # embed AA_DSMamba2 at the final encoder stage
+        self.sda = SDA_Module(in_channels=1024)
+
         self.mamba2 = AA_DSMamba2(1024, 1024, 32)
 
         self.u1 = Upsample(1024)
@@ -112,29 +108,21 @@ class SFD_Mamba2Net(nn.Module):
         self.c9 = Conv_Block(128, 64)
 
         self.out = Conv2d(64, 1, 3, 1, 1)
-        self.TH = nn.Sigmoid()
 
-    def forward(self, x):
-        # downsampling pathway
+    def forward(self, x, lambd=0.1, cond=None):
         R1 = self.c1(x)
-
-        # embed CASE after the first encoder layer
         CASE_features = self.CASE(x)
-        # concatenate features: [B, 64 + 1 = 65, H, W]
         R1 = torch.cat([R1, CASE_features], dim=1)
-        # dynamic channel selection: adaptive fusion & output 64 channels
-        R1 = self.channel_attn(R1)  # [B, 64, H, W]
+        R1 = self.channel_attn(R1)
 
         R2 = self.c2(self.d1(R1))
         R3 = self.c3(self.d2(R2))
         R4 = self.c4(self.d3(R3))
         R5 = self.c5(self.d4(R4))
+        R5_grl, dom_out = self.sda(R5, lambd=lambd, cond=cond)
+        R5_grl = self.mamba2(R5_grl)
 
-        # embed AA_DSMamba2 at the final encoder layer
-        R5 = self.mamba2(R5)
-
-        # upsampling pathway with skip connections
-        O1 = self.u1(R5, R4)
+        O1 = self.u1(R5_grl, R4)
         O1 = self.PHFP1(O1)
         O1 = self.c6(O1)
 
@@ -150,10 +138,16 @@ class SFD_Mamba2Net(nn.Module):
         O4 = self.PHFP4(O4)
         O4 = self.c9(O4)
 
-        return self.TH(self.out(O4))
+        pred = self.out(O4)
+
+        return pred, dom_out
 
 
 if __name__ == '__main__':
-    x = torch.randn(2, 1, 512, 512)  # input: grayscale images
+    x = torch.randn(2, 1, 512, 512)
+    cond = torch.randint(0, 2, (2, 1, 8, 8)).float()
     net = SFD_Mamba2Net()
-    print(net(x).shape)  # output shape
+    pred, dom_out = net(x, lambd=0.1, cond=cond)
+    print("pred:", pred.shape)
+    print("dom_out:", dom_out.shape)
+    print("params:", sum(p.numel() for p in net.parameters()) / 1e6, "M")
